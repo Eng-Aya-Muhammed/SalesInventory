@@ -38,35 +38,25 @@ The project implements **Clean Architecture**, **CQRS with MediatR**, **FluentVa
 
 The solution adheres strictly to **Clean Architecture** (Onion Architecture) guidelines, enforcing unidirectional dependencies pointing inward toward the domain:
 
-```mermaid
-graph TD
-    API["SalesInventory.Api (Presentation)"]
-    INFRA["SalesInventory.Infrastructure (Persistence / EF Core)"]
-    APP["SalesInventory.Application (Business Logic / CQRS)"]
-    DOMAIN["SalesInventory.Domain (Enterprise Entities & Enums)"]
-    TESTS["SalesInventory.Tests (Unit & Integration)"]
-
-    API --> APP
-    INFRA --> APP
-    APP --> DOMAIN
-    INFRA --> DOMAIN
-    API --> INFRA
-    TESTS -.-> API
-    TESTS -.-> APP
-    TESTS -.-> INFRA
-    TESTS -.-> DOMAIN
-
-    classDef core fill:#4A90E2,stroke:#1D62B4,color:#fff,font-weight:bold;
-    classDef app fill:#50E3C2,stroke:#00A887,color:#000,font-weight:bold;
-    classDef infra fill:#F5A623,stroke:#C67A00,color:#fff,font-weight:bold;
-    classDef api fill:#BD10E0,stroke:#8A00A8,color:#fff,font-weight:bold;
-    classDef test fill:#7ED321,stroke:#53960E,color:#000,font-weight:bold;
-
-    class DOMAIN core;
-    class APP app;
-    class INFRA infra;
-    class API api;
-    class TESTS test;
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                        SalesInventory.Api                              │
+│       (Presentation: Controllers, Swagger, Exception Middleware)       │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                    SalesInventory.Application                          │
+│     (Business Logic: CQRS, MediatR, FluentValidation, DTOs, Mappings)  │
+└───────────────────┬────────────────────────────────┬───────────────────┘
+                    │                                │
+                    ▼                                ▼
+┌──────────────────────────────────────┐  ┌──────────────────────────────┐
+│       SalesInventory.Domain          │  │ SalesInventory.Infrastructure│
+│ (Core Entities, Value Objects, Enums)│  │ (EF Core, SQL Server, Migr.) │
+└──────────────────────────────────────┘  └──────────────┬───────────────┘
+                    ▲                                    │
+                    └────────────────────────────────────┘
 ```
 
 ### Layer Responsibilities
@@ -221,43 +211,45 @@ SalesInventory/
 
 All requests flow through a MediatR pipeline governed by cross-cutting behaviors:
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Client
-    participant Middleware as ExceptionHandlingMiddleware
-    participant Controller as Api Controller
-    participant MediatR as MediatR Pipeline
-    participant Log as LoggingBehavior
-    participant Val as ValidationBehavior (FluentValidation)
-    participant Handler as CQRS Handler
-    participant UOW as UnitOfWork / Repositories
-    participant DB as SQL Server
-
-    Client->>Middleware: HTTP Request (JSON)
-    Middleware->>Controller: Route to Action
-    Controller->>MediatR: Send(Command / Query)
-    MediatR->>Log: Log Handling Request
-    Log->>Val: Pass to Validation
-    alt Validation Fails
-        Val-->>Middleware: Throw ValidationException (400)
-        Middleware-->>Client: 400 ValidationProblemDetails (RFC 7807)
-    else Validation Passes
-        Val->>Handler: Invoke Handler
-        Handler->>UOW: BeginTransactionAsync()
-        Handler->>UOW: Query / Mutate Repositories
-        UOW->>DB: Execute SQL / Checks
-        alt Concurrency / Stock Conflict
-            DB-->>UOW: DbUpdateConcurrencyException / Constraint Failure
-            UOW->>UOW: RollbackTransactionAsync()
-            UOW-->>Middleware: Throw ConflictException (409)
-            Middleware-->>Client: 409 ProblemDetails
-        else Success
-            UOW->>DB: SaveChangesAsync() + CommitTransactionAsync()
-            Handler-->>Controller: Return Result DTO
-            Controller-->>Client: 200 OK / 201 Created (Location Header)
-        end
-    end
+```text
+[ Inbound HTTP Request: JSON Payload ]
+                  │
+                  ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 1. ExceptionHandlingMiddleware                                         │
+│    - Global try-catch boundary                                         │
+│    - Catches domain exceptions and serializes to RFC 7807 ProblemDetails│
+└─────────────────────────────────────┬──────────────────────────────────┘
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 2. ASP.NET Core API Controller                                         │
+│    - Thin entry point; delegates command / query to MediatR (Send)     │
+└─────────────────────────────────────┬──────────────────────────────────┘
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 3. MediatR Pipeline: LoggingBehavior                                   │
+│    - Logs telemetry for inbound request handling & timing              │
+└─────────────────────────────────────┬──────────────────────────────────┘
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 4. MediatR Pipeline: ValidationBehavior (FluentValidation)             │
+│    - Executes all registered IValidator<TRequest> rules                │
+│    - On validation failure: throws ValidationException (400 Bad Req)   │
+└─────────────────────────────────────┬──────────────────────────────────┘
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 5. CQRS Handler                                                        │
+│    - Executes application business logic & orchestrates domain entities│
+│    - Invokes repositories and UnitOfWork boundaries                    │
+└─────────────────────────────────────┬──────────────────────────────────┘
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 6. UnitOfWork / EF Core / SQL Server                                   │
+│    - Explicit database transaction boundary (BeginTransactionAsync)    │
+│    - Optimistic concurrency check via SQL Server 'rowversion' token    │
+│    - Concurrency conflict: rolls back transaction & throws 409 Conflict│
+│    - On success: commits transaction & returns 200 OK / 201 Created    │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
